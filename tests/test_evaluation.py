@@ -1,110 +1,120 @@
+"""
+RAGAS-based evaluation for CiteRAG.
+
+Metrics computed:
+  • answer_relevancy   – cosine similarity of answer embedding vs question
+  • faithfulness       – fraction of answer claims supported by context
+  • context_recall     – how much of the gold answer is covered by context
+  • context_precision  – signal-to-noise in retrieved context
+
+Thresholds are loaded from eval/config.yaml.
+"""
+from __future__ import annotations
+
 import json
 from pathlib import Path
-from typing import List, Tuple
+from typing import List
 
 import pytest
 import yaml
-from rapidfuzz.fuzz import token_set_ratio
-
-from app.retrieval.pipeline import RetrievalPipeline
-
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-DOCS_DIR = PROJECT_ROOT / "docs"
+DOCS_DIR     = PROJECT_ROOT / "docs"
+DATASET_DIR  = PROJECT_ROOT / "dataset"
 EVAL_DATASET = PROJECT_ROOT / "eval" / "dataset.jsonl"
-EVAL_CONFIG = PROJECT_ROOT / "eval" / "config.yaml"
+EVAL_CONFIG  = PROJECT_ROOT / "eval" / "config.yaml"
 
 
-def load_dataset() -> List[dict]:
-  lines: List[dict] = []
-  with EVAL_DATASET.open("r", encoding="utf-8") as f:
-    for line in f:
-      line = line.strip()
-      if not line:
-        continue
-      lines.append(json.loads(line))
-  return lines
+def load_eval_dataset() -> List[dict]:
+    rows: List[dict] = []
+    with EVAL_DATASET.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                rows.append(json.loads(line))
+    return rows
 
 
-def compute_retrieval_metrics(
-  gold_doc_ids: List[str], retrieved_doc_ids: List[str]
-) -> Tuple[float, float]:
-  """Return (recall, reciprocal_rank) for a single example."""
-  if not gold_doc_ids:
-    return 1.0, 1.0
-
-  gold_set = set(gold_doc_ids)
-  retrieved = list(retrieved_doc_ids)
-
-  # recall@k
-  hits = [doc_id for doc_id in retrieved if doc_id in gold_set]
-  recall = len(hits) / len(gold_set)
-
-  # MRR@k
-  rr = 0.0
-  for rank, doc_id in enumerate(retrieved, start=1):
-    if doc_id in gold_set:
-      rr = 1.0 / rank
-      break
-
-  return recall, rr
-
-
-def compute_answer_f1(expected: str, predicted: str) -> float:
-  """Use token-set similarity as a proxy F1."""
-  if not expected.strip():
-    return 1.0
-  if not predicted.strip():
-    return 0.0
-  # rapidfuzz returns 0-100
-  return token_set_ratio(expected, predicted) / 100.0
+def load_config() -> dict:
+    with EVAL_CONFIG.open("r", encoding="utf-8") as f:
+        return yaml.safe_load(f)
 
 
 @pytest.mark.slow
-def test_rag_eval_meets_thresholds() -> None:
-  assert DOCS_DIR.exists(), "docs/ directory must exist"
-  assert EVAL_DATASET.exists(), "eval/dataset.jsonl must exist"
-  assert EVAL_CONFIG.exists(), "eval/config.yaml must exist"
+def test_rag_eval_ragas() -> None:
+    """Run RAGAS evaluation and assert each metric meets its threshold."""
+    try:
+        from ragas import evaluate
+        from ragas.metrics import (
+            answer_relevancy,
+            faithfulness,
+            context_recall,
+            context_precision,
+        )
+        from datasets import Dataset
+    except ImportError as e:
+        pytest.skip(f"RAGAS or datasets not installed: {e}")
 
-  with EVAL_CONFIG.open("r", encoding="utf-8") as f:
-    cfg = yaml.safe_load(f)
+    from app.retrieval.pipeline import RetrievalPipeline
 
-  min_recall = float(cfg.get("min_recall_at_5", 0.0))
-  min_mrr = float(cfg.get("min_mrr_at_5", 0.0))
-  min_answer_f1 = float(cfg.get("min_answer_f1", 0.0))
-  top_k = int(cfg.get("top_k", 5))
+    assert DOCS_DIR.exists(),     "docs/ directory must exist"
+    assert EVAL_DATASET.exists(), "eval/dataset.jsonl must exist"
+    assert EVAL_CONFIG.exists(),  "eval/config.yaml must exist"
 
-  pipeline = RetrievalPipeline(docs_path=DOCS_DIR)
-  data = load_dataset()
+    cfg    = load_config()
+    top_k  = int(cfg.get("top_k", 5))
 
-  recalls: List[float] = []
-  mrrs: List[float] = []
-  f1s: List[float] = []
+    min_answer_relevancy   = float(cfg.get("min_answer_relevancy", 0.5))
+    min_faithfulness       = float(cfg.get("min_faithfulness", 0.5))
+    min_context_recall     = float(cfg.get("min_context_recall", 0.5))
+    min_context_precision  = float(cfg.get("min_context_precision", 0.5))
 
-  for row in data:
-    question = row["question"]
-    gold_doc_ids = row.get("relevant_doc_ids", [])
-    expected_answer = row.get("expected_answer", "")
+    pipe   = RetrievalPipeline(docs_path=DOCS_DIR, dataset_path=DATASET_DIR)
+    rows   = load_eval_dataset()
 
-    result = pipeline.answer(question, top_k=top_k)
-    retrieved_doc_ids = [c.doc_id for c in result.citations]
+    questions:   List[str]       = []
+    answers:     List[str]       = []
+    contexts:    List[List[str]] = []
+    ground_truths: List[str]     = []
 
-    recall, rr = compute_retrieval_metrics(gold_doc_ids, retrieved_doc_ids)
-    f1 = compute_answer_f1(expected_answer, result.answer)
+    for row in rows:
+        question       = row["question"]
+        expected       = row.get("expected_answer", "")
+        result         = pipe.answer(question, top_k=top_k)
+        retrieved_ctx  = [c.text for c in result.citations]
 
-    recalls.append(recall)
-    mrrs.append(rr)
-    f1s.append(f1)
+        questions.append(question)
+        answers.append(result.answer)
+        contexts.append(retrieved_ctx if retrieved_ctx else [""])
+        ground_truths.append(expected)
 
-  mean_recall = sum(recalls) / len(recalls) if recalls else 0.0
-  mean_mrr = sum(mrrs) / len(mrrs) if mrrs else 0.0
-  mean_f1 = sum(f1s) / len(f1s) if f1s else 0.0
+    ragas_dataset = Dataset.from_dict(
+        {
+            "question":      questions,
+            "answer":        answers,
+            "contexts":      contexts,
+            "ground_truth":  ground_truths,
+        }
+    )
 
-  print(f"RAG eval: recall@5={mean_recall:.3f}, mrr@5={mean_mrr:.3f}, f1={mean_f1:.3f}")
+    result = evaluate(
+        ragas_dataset,
+        metrics=[answer_relevancy, faithfulness, context_recall, context_precision],
+    )
 
-  assert (
-    mean_recall >= min_recall
-  ), f"Recall@5 {mean_recall:.3f} < threshold {min_recall:.3f}"
-  assert mean_mrr >= min_mrr, f"MRR@5 {mean_mrr:.3f} < threshold {min_mrr:.3f}"
-  assert mean_f1 >= min_answer_f1, f"Answer F1 {mean_f1:.3f} < threshold {min_answer_f1:.3f}"
+    scores = result.to_pandas().mean(numeric_only=True)
 
+    ar  = float(scores.get("answer_relevancy",  0.0))
+    ff  = float(scores.get("faithfulness",       0.0))
+    cr  = float(scores.get("context_recall",     0.0))
+    cp  = float(scores.get("context_precision",  0.0))
+
+    print(
+        f"\n[RAGAS] answer_relevancy={ar:.3f}  faithfulness={ff:.3f}  "
+        f"context_recall={cr:.3f}  context_precision={cp:.3f}"
+    )
+
+    assert ar >= min_answer_relevancy,  f"answer_relevancy {ar:.3f} < {min_answer_relevancy}"
+    assert ff >= min_faithfulness,      f"faithfulness {ff:.3f} < {min_faithfulness}"
+    assert cr >= min_context_recall,    f"context_recall {cr:.3f} < {min_context_recall}"
+    assert cp >= min_context_precision, f"context_precision {cp:.3f} < {min_context_precision}"

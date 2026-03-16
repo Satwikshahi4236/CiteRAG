@@ -1,25 +1,36 @@
+"""
+CiteRAG – Retrieval Pipeline (v2)
+====================================
+Tech stack:
+  • LangGraph  – stateful retrieval workflow (graph-based orchestration)
+  • ChromaDB   – persistent vector store with versioned collections
+  • CrossEncoder (sentence-transformers) – passage reranking
+  • BM25 (rank-bm25) – lexical retrieval leg of hybrid search
+"""
 from __future__ import annotations
 
+import hashlib
 import json
-import os
-import pickle
-from dataclasses import dataclass
+import re
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Tuple, Optional
+from typing import Annotated, List, Optional, TypedDict
 
-import faiss
+import chromadb
 import numpy as np
+from chromadb.config import Settings
+from langchain_core.documents import Document as LCDocument
+from langchain_community.document_loaders import TextLoader, DirectoryLoader
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_huggingface import HuggingFaceEmbeddings
+from langgraph.graph import StateGraph, END
 from rank_bm25 import BM25Okapi
-from sentence_transformers import CrossEncoder, SentenceTransformer
-from sklearn.preprocessing import normalize
+from sentence_transformers import CrossEncoder
 
 
-
-@dataclass
-class Document:
-    doc_id: str
-    text: str
-
+# ---------------------------------------------------------------------------
+# Data models
+# ---------------------------------------------------------------------------
 
 @dataclass
 class CitationResult:
@@ -32,234 +43,339 @@ class CitationResult:
 class AnswerResult:
     answer: str
     citations: List[CitationResult]
+    pipeline_version: str = "v2"
 
+
+# ---------------------------------------------------------------------------
+# LangGraph state  (typed dict travels through nodes)
+# ---------------------------------------------------------------------------
+
+class RAGState(TypedDict):
+    query: str
+    top_k: int
+    bm25_hits: List[dict]          # [{doc_id, text, score}]
+    vector_hits: List[dict]        # [{doc_id, text, score}]
+    hybrid_hits: List[dict]        # fused
+    reranked: List[dict]           # after cross-encoder
+    answer: str
+    citations: List[CitationResult]
+
+
+# ---------------------------------------------------------------------------
+# Pipeline
+# ---------------------------------------------------------------------------
 
 class RetrievalPipeline:
     """
-    Hybrid retrieval (BM25 + vector) with cross-encoder reranking and
-    simple extractive answer generation that enforces citations.
+    LangGraph-orchestrated Hybrid RAG pipeline:
+      retrieve_bm25  ──┐
+                       ├─► fuse ──► rerank ──► generate
+      retrieve_vector ─┘
     """
 
-    def __init__(self, docs_path: Path, dataset_path: Optional[Path] = None, embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2",
-                 cross_encoder_model: str = "cross-encoder/ms-marco-MiniLM-L-6-v2") -> None:
+    COLLECTION_VERSION = "v2"   # bump to re-index when schema changes
+
+    def __init__(
+        self,
+        docs_path: Path,
+        dataset_path: Optional[Path] = None,
+        embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2",
+        cross_encoder_model: str = "cross-encoder/ms-marco-MiniLM-L-6-v2",
+        chroma_persist_dir: Optional[Path] = None,
+        dataset_limit: int = 200,
+    ) -> None:
         self.docs_path = docs_path
         self.dataset_path = dataset_path
-        self.embedding_model = SentenceTransformer(embedding_model)
+        self.dataset_limit = dataset_limit
+        self.chroma_persist_dir = chroma_persist_dir or docs_path.parent / ".chroma_store"
+
+        # ------------------------------------------------------------------
+        # Embedding model (LangChain wrapper around sentence-transformers)
+        # ------------------------------------------------------------------
+        self.embeddings = HuggingFaceEmbeddings(model_name=embedding_model)
+
+        # ------------------------------------------------------------------
+        # Cross-encoder reranker
+        # ------------------------------------------------------------------
         self.cross_encoder = CrossEncoder(cross_encoder_model)
-        self.documents: List[Document] = []
 
-        self._bm25: BM25Okapi | None = None
-        self._faiss_index: faiss.IndexFlatIP | None = None
-        self._embeddings: np.ndarray | None = None
-        self.cache_dir = self.docs_path.parent / ".index_cache"
+        # ------------------------------------------------------------------
+        # ChromaDB persistent vector store (versioned collection)
+        # ------------------------------------------------------------------
+        self._chroma_client = chromadb.PersistentClient(
+            path=str(self.chroma_persist_dir),
+            settings=Settings(anonymized_telemetry=False),
+        )
+        collection_name = f"citerag_{self.COLLECTION_VERSION}"
+        self._collection = self._chroma_client.get_or_create_collection(
+            name=collection_name,
+            metadata={"hnsw:space": "cosine"},
+        )
 
-        if self._load_from_cache():
-            return
+        # ------------------------------------------------------------------
+        # Load documents and build / refresh indices
+        # ------------------------------------------------------------------
+        self._raw_docs: List[LCDocument] = []
+        self._bm25: Optional[BM25Okapi] = None
 
+        needs_index = self._collection.count() == 0
         self._load_documents()
-        self._build_indices()
-        self._save_to_cache()
+        if needs_index and self._raw_docs:
+            self._build_chroma_index()
+        self._build_bm25()
 
-    # --- Indexing helpers -------------------------------------------------
+        # ------------------------------------------------------------------
+        # Build LangGraph workflow
+        # ------------------------------------------------------------------
+        self._graph = self._build_graph()
 
-    def _chunk_text(self, text: str, chunk_size: int = 250, overlap: int = 50) -> List[str]:
-        words = text.split()
-        if len(words) <= chunk_size:
-            return [text]
-        chunks = []
-        for i in range(0, len(words), chunk_size - overlap):
-            chunk = " ".join(words[i : i + chunk_size])
-            chunks.append(chunk)
-            if i + chunk_size >= len(words):
-                break
-        return chunks
+    # -----------------------------------------------------------------------
+    # Document loading
+    # -----------------------------------------------------------------------
+
+    def _chunk_text(self, text: str) -> List[str]:
+        splitter = RecursiveCharacterTextSplitter(
+            chunk_size=500, chunk_overlap=80, separators=["\n\n", "\n", " "]
+        )
+        return splitter.split_text(text)
 
     def _load_documents(self) -> None:
-        docs: List[Document] = []
+        docs: List[LCDocument] = []
+
+        # ── Plain docs (Markdown / txt) ────────────────────────────────────
         for path in sorted(self.docs_path.rglob("*")):
             if not path.is_file():
                 continue
             if path.suffix.lower() not in {".md", ".txt"}:
                 continue
-            text = path.read_text(encoding="utf-8", errors="ignore")
-            if not text.strip():
+            raw = path.read_text(encoding="utf-8", errors="ignore").strip()
+            if not raw:
                 continue
-            # Normalize to POSIX-style separators so doc_ids are stable
-            # across platforms (e.g., for evaluation datasets).
             doc_id = path.relative_to(self.docs_path).as_posix()
-            
-            for chunk in self._chunk_text(text):
-                docs.append(Document(doc_id=doc_id, text=chunk))
+            for chunk in self._chunk_text(raw):
+                docs.append(LCDocument(page_content=chunk, metadata={"doc_id": doc_id}))
 
+        # ── JSONL dataset ──────────────────────────────────────────────────
         if self.dataset_path and self.dataset_path.exists():
             for path in sorted(self.dataset_path.rglob("*.jsonl")):
                 count = 0
-                batch_limit = 200 # Reduced limit so it loads quickly
                 try:
                     with open(path, "r", encoding="utf-8") as f:
                         for line in f:
-                            if count >= batch_limit:
+                            if count >= self.dataset_limit:
                                 break
-                            if not line.strip(): continue
+                            line = line.strip()
+                            if not line:
+                                continue
                             try:
                                 data = json.loads(line)
                                 title = data.get("title", "")
                                 abstract = data.get("abstract", "")
-                                doc_id = data.get("id", data.get("abs_url", ""))
+                                doc_id = data.get("id", data.get("abs_url", "unknown"))
                                 text = f"{title}\n{abstract}".strip()
-                                if not text: continue
+                                if not text:
+                                    continue
                                 for chunk in self._chunk_text(text):
-                                    docs.append(Document(doc_id=doc_id, text=chunk))
+                                    docs.append(
+                                        LCDocument(
+                                            page_content=chunk,
+                                            metadata={"doc_id": doc_id},
+                                        )
+                                    )
                                 count += 1
                             except json.JSONDecodeError:
                                 continue
                 except Exception as e:
-                    print(f"Error loading {path}: {e}")
+                    print(f"[CiteRAG] Error loading {path}: {e}")
 
-        self.documents = docs
+        self._raw_docs = docs
 
-    def _load_from_cache(self) -> bool:
-        if not self.cache_dir.exists():
-            return False
-        docs_path = self.cache_dir / "documents.pkl"
-        bm25_path = self.cache_dir / "bm25.pkl"
-        faiss_path = self.cache_dir / "index.faiss"
-        embeddings_path = self.cache_dir / "embeddings.npy"
-        
-        if not all(p.exists() for p in [docs_path, bm25_path, faiss_path, embeddings_path]):
-            return False
-            
-        try:
-            with open(docs_path, "rb") as f:
-                self.documents = pickle.load(f)
-            with open(bm25_path, "rb") as f:
-                self._bm25 = pickle.load(f)
-            self._faiss_index = faiss.read_index(str(faiss_path))
-            self._embeddings = np.load(embeddings_path)
-            return True
-        except Exception:
-            return False
+    # -----------------------------------------------------------------------
+    # Index building
+    # -----------------------------------------------------------------------
 
-    def _save_to_cache(self) -> None:
-        self.cache_dir.mkdir(parents=True, exist_ok=True)
-        try:
-            with open(self.cache_dir / "documents.pkl", "wb") as f:
-                pickle.dump(self.documents, f)
-            with open(self.cache_dir / "bm25.pkl", "wb") as f:
-                pickle.dump(self._bm25, f)
-            faiss.write_index(self._faiss_index, str(self.cache_dir / "index.faiss"))
-            np.save(self.cache_dir / "embeddings.npy", self._embeddings)
-        except Exception as e:
-            print(f"Failed to save cache: {e}")
-
-    def _build_indices(self) -> None:
-        corpus = [d.text for d in self.documents]
-        if not corpus:
-            self._bm25 = BM25Okapi([["empty"]])
-            dim = 384
-            self._faiss_index = faiss.IndexFlatIP(dim)
-            self._embeddings = np.zeros((1, dim), dtype="float32")
-            return
-
-        tokenized_corpus = [doc.split() for doc in corpus]
-        self._bm25 = BM25Okapi(tokenized_corpus)
-
-        embeddings = self.embedding_model.encode(corpus, convert_to_numpy=True, show_progress_bar=False, batch_size=256)
-        embeddings = normalize(embeddings, axis=1)
-        dim = embeddings.shape[1]
-        index = faiss.IndexFlatIP(dim)
-        index.add(embeddings.astype("float32"))
-
-        self._faiss_index = index
-        self._embeddings = embeddings.astype("float32")
-
-    # --- Retrieval --------------------------------------------------------
-
-    def _bm25_search(self, query: str, k: int) -> List[Tuple[int, float]]:
-        assert self._bm25 is not None
-        scores = self._bm25.get_scores(query.split())
-        idxs = np.argsort(scores)[::-1][:k]
-        return [(int(i), float(scores[i])) for i in idxs]
-
-    def _vector_search(self, query: str, k: int) -> List[Tuple[int, float]]:
-        assert self._faiss_index is not None
-        query_emb = self.embedding_model.encode([query], convert_to_numpy=True, show_progress_bar=False)
-        query_emb = normalize(query_emb, axis=1).astype("float32")
-        scores, idxs = self._faiss_index.search(query_emb, k)
-        return [(int(idx), float(score)) for idx, score in zip(idxs[0], scores[0])]
-
-    def _hybrid_search(self, query: str, k: int = 10, alpha: float = 0.5) -> List[Tuple[int, float]]:
-        """
-        Combine BM25 and vector scores with simple interpolation:
-        score = alpha * bm25_norm + (1 - alpha) * dense_norm
-        """
-        k = max(k, 1)
-        bm25_results = self._bm25_search(query, k=k * 4)
-        vec_results = self._vector_search(query, k=k * 4)
-
-        bm25_dict = {idx: score for idx, score in bm25_results}
-        vec_dict = {idx: score for idx, score in vec_results}
-
-        all_idxs = sorted(set(bm25_dict.keys()) | set(vec_dict.keys()))
-        if not all_idxs:
-            return []
-
-        bm25_scores = np.array([bm25_dict.get(i, 0.0) for i in all_idxs])
-        vec_scores = np.array([vec_dict.get(i, 0.0) for i in all_idxs])
-
-        if bm25_scores.max() > 0:
-            bm25_scores = bm25_scores / (bm25_scores.max() + 1e-9)
-        if vec_scores.max() > 0:
-            vec_scores = vec_scores / (vec_scores.max() + 1e-9)
-
-        combined = alpha * bm25_scores + (1 - alpha) * vec_scores
-        order = np.argsort(combined)[::-1][:k]
-        return [(int(all_idxs[i]), float(combined[i])) for i in order]
-
-    # --- Reranking & Answering -------------------------------------------
-
-    def _rerank(self, query: str, candidate_idxs: List[int], top_k: int) -> List[Tuple[int, float]]:
-        if not candidate_idxs:
-            return []
-        pairs = [(query, self.documents[idx].text) for idx in candidate_idxs]
-        scores = self.cross_encoder.predict(pairs, batch_size=256)
-        order = np.argsort(scores)[::-1][:top_k]
-        return [(candidate_idxs[i], float(scores[i])) for i in order]
-
-    def answer(self, query: str, top_k: int = 5) -> AnswerResult:
-        """
-        Run hybrid retrieval, cross-encoder reranking, and then generate
-        an extractive answer composed directly from top passages.
-        """
-        if not self.documents:
-            return AnswerResult(
-                answer="No documents are indexed yet. Please add files under the docs/ directory.",
-                citations=[],
+    def _build_chroma_index(self) -> None:
+        """Embed and upsert all documents into ChromaDB."""
+        texts = [d.page_content for d in self._raw_docs]
+        metadatas = [d.metadata for d in self._raw_docs]
+        ids = [
+            hashlib.md5(f"{m['doc_id']}::{t}".encode()).hexdigest()
+            for m, t in zip(metadatas, texts)
+        ]
+        # Batch upsert (Chroma handles deduplication by ID)
+        batch = 512
+        for i in range(0, len(texts), batch):
+            embeddings = self.embeddings.embed_documents(texts[i : i + batch])
+            self._collection.upsert(
+                ids=ids[i : i + batch],
+                documents=texts[i : i + batch],
+                embeddings=embeddings,
+                metadatas=metadatas[i : i + batch],
             )
 
-        hybrid_candidates = self._hybrid_search(query, k=max(top_k * 4, 10))
-        candidate_idxs = [idx for idx, _ in hybrid_candidates]
-        reranked = self._rerank(query, candidate_idxs, top_k=top_k)
+    def _build_bm25(self) -> None:
+        """Build BM25 index over all raw docs."""
+        if not self._raw_docs:
+            self._bm25 = BM25Okapi([["empty"]])
+            return
+        corpus = [d.page_content for d in self._raw_docs]
+        self._bm25 = BM25Okapi([doc.split() for doc in corpus])
 
+    # -----------------------------------------------------------------------
+    # LangGraph nodes
+    # -----------------------------------------------------------------------
+
+    def _node_retrieve_bm25(self, state: RAGState) -> RAGState:
+        if not self._raw_docs:
+            return {**state, "bm25_hits": []}
+        scores = self._bm25.get_scores(state["query"].split())
+        k = state["top_k"] * 4
+        idxs = np.argsort(scores)[::-1][:k]
+        hits = [
+            {
+                "doc_id": self._raw_docs[i].metadata["doc_id"],
+                "text": self._raw_docs[i].page_content,
+                "score": float(scores[i]),
+            }
+            for i in idxs
+            if float(scores[i]) > 0
+        ]
+        return {**state, "bm25_hits": hits}
+
+    def _node_retrieve_vector(self, state: RAGState) -> RAGState:
+        k = state["top_k"] * 4
+        query_emb = self.embeddings.embed_query(state["query"])
+        results = self._collection.query(
+            query_embeddings=[query_emb],
+            n_results=min(k, self._collection.count() or 1),
+            include=["documents", "metadatas", "distances"],
+        )
+        hits = []
+        for doc, meta, dist in zip(
+            results["documents"][0],
+            results["metadatas"][0],
+            results["distances"][0],
+        ):
+            hits.append(
+                {
+                    "doc_id": meta.get("doc_id", "unknown"),
+                    "text": doc,
+                    "score": float(1 - dist),   # cosine distance → similarity
+                }
+            )
+        return {**state, "vector_hits": hits}
+
+    def _node_fuse(self, state: RAGState) -> RAGState:
+        """Reciprocal Rank Fusion of BM25 + vector results."""
+        k_rrf = 60
+        scores: dict[str, float] = {}
+        texts: dict[str, str] = {}
+        doc_ids: dict[str, str] = {}
+
+        for rank, hit in enumerate(state["bm25_hits"]):
+            key = hit["text"][:120]
+            scores[key] = scores.get(key, 0) + 1.0 / (k_rrf + rank + 1)
+            texts[key] = hit["text"]
+            doc_ids[key] = hit["doc_id"]
+
+        for rank, hit in enumerate(state["vector_hits"]):
+            key = hit["text"][:120]
+            scores[key] = scores.get(key, 0) + 1.0 / (k_rrf + rank + 1)
+            texts[key] = hit["text"]
+            doc_ids[key] = hit["doc_id"]
+
+        top_k = state["top_k"] * 2
+        sorted_keys = sorted(scores, key=scores.__getitem__, reverse=True)[:top_k]
+        hybrid_hits = [
+            {"doc_id": doc_ids[k], "text": texts[k], "score": scores[k]}
+            for k in sorted_keys
+        ]
+        return {**state, "hybrid_hits": hybrid_hits}
+
+    def _node_rerank(self, state: RAGState) -> RAGState:
+        hits = state["hybrid_hits"]
+        if not hits:
+            return {**state, "reranked": []}
+        pairs = [(state["query"], h["text"]) for h in hits]
+        ce_scores = self.cross_encoder.predict(pairs, batch_size=64)
+        order = np.argsort(ce_scores)[::-1][: state["top_k"]]
+        reranked = [
+            {**hits[i], "score": float(ce_scores[i])}
+            for i in order
+        ]
+        return {**state, "reranked": reranked}
+
+    def _node_generate(self, state: RAGState) -> RAGState:
+        """Extractive answer assembly with Markdown stripping."""
+        hits = state["reranked"]
+        if not hits:
+            return {
+                **state,
+                "answer": "I could not find relevant content for your query.",
+                "citations": [],
+            }
         citations: List[CitationResult] = []
-        answer_parts: List[str] = []
-        import re
-        for idx, score in reranked:
-            doc = self.documents[idx]
-            snippet = doc.text.strip()
+        parts: List[str] = []
+        for h in hits:
+            snippet = h["text"].strip()
             if len(snippet) > 600:
                 snippet = snippet[:600].rsplit("\n", 1)[0]
-            # Strip markdown for cleaner metrics matching against expected flat text
-            clean_snippet = re.sub(r'[*#_]', '', snippet)
-            citations.append(CitationResult(doc_id=doc.doc_id, text=snippet, score=score))
-            answer_parts.append(clean_snippet)
+            clean = re.sub(r"[*#_]", "", snippet)
+            citations.append(CitationResult(doc_id=h["doc_id"], text=snippet, score=h["score"]))
+            parts.append(clean)
+        answer = "\n\n---\n\n".join(parts)
+        return {**state, "answer": answer, "citations": citations}
 
-        if not answer_parts:
+    # -----------------------------------------------------------------------
+    # Graph assembly
+    # -----------------------------------------------------------------------
+
+    def _build_graph(self) -> StateGraph:
+        g = StateGraph(RAGState)
+        g.add_node("retrieve_bm25", self._node_retrieve_bm25)
+        g.add_node("retrieve_vector", self._node_retrieve_vector)
+        g.add_node("fuse", self._node_fuse)
+        g.add_node("rerank", self._node_rerank)
+        g.add_node("generate", self._node_generate)
+
+        g.set_entry_point("retrieve_bm25")
+        g.add_edge("retrieve_bm25", "retrieve_vector")
+        g.add_edge("retrieve_vector", "fuse")
+        g.add_edge("fuse", "rerank")
+        g.add_edge("rerank", "generate")
+        g.add_edge("generate", END)
+        return g.compile()
+
+    # -----------------------------------------------------------------------
+    # Public API
+    # -----------------------------------------------------------------------
+
+    def answer(self, query: str, top_k: int = 5) -> AnswerResult:
+        if not self._raw_docs:
             return AnswerResult(
-                answer="I could not find relevant content in the indexed documents for this query.",
+                answer="No documents indexed yet. Add files to docs/ or dataset/.",
                 citations=[],
             )
+        initial_state: RAGState = {
+            "query": query,
+            "top_k": top_k,
+            "bm25_hits": [],
+            "vector_hits": [],
+            "hybrid_hits": [],
+            "reranked": [],
+            "answer": "",
+            "citations": [],
+        }
+        final_state = self._graph.invoke(initial_state)
+        return AnswerResult(
+            answer=final_state["answer"],
+            citations=final_state["citations"],
+        )
 
-        answer = "\n\n---\n\n".join(answer_parts)
-        return AnswerResult(answer=answer, citations=citations)
+    @property
+    def document_count(self) -> int:
+        return len(self._raw_docs)
 
+    @property
+    def collection_version(self) -> str:
+        return self.COLLECTION_VERSION

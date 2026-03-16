@@ -2,6 +2,6 @@
 __pycache__/
 .pytest_cache/
 .index_cache/
-*.pyc
-
+.chroma_store/
 dataset/
+*.pyc
