@@ -1,0 +1,264 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>Ask My Docs</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <style>
+      body {
+        font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI",
+          sans-serif;
+        margin: 0;
+        padding: 0;
+        background: #0f172a;
+        color: #e5e7eb;
+      }
+      .container {
+        max-width: 960px;
+        margin: 0 auto;
+        padding: 24px 16px 64px;
+      }
+      h1 {
+        font-size: 1.9rem;
+        margin-bottom: 0.25rem;
+      }
+      .subtitle {
+        color: #9ca3af;
+        margin-bottom: 1.5rem;
+      }
+      .card {
+        background: #020617;
+        border-radius: 14px;
+        padding: 18px 20px;
+        box-shadow: 0 20px 40px rgba(15, 23, 42, 0.7);
+        border: 1px solid #1e293b;
+      }
+      label {
+        font-size: 0.9rem;
+        color: #9ca3af;
+      }
+      textarea {
+        width: 100%;
+        resize: vertical;
+        min-height: 64px;
+        margin-top: 0.3rem;
+        border-radius: 10px;
+        border: 1px solid #334155;
+        background: #020617;
+        color: #e5e7eb;
+        padding: 10px 12px;
+        font-size: 0.95rem;
+      }
+      textarea:focus {
+        outline: none;
+        border-color: #38bdf8;
+        box-shadow: 0 0 0 1px #38bdf8;
+      }
+      .actions {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        margin-top: 0.9rem;
+        gap: 8px;
+      }
+      button {
+        background: linear-gradient(135deg, #0ea5e9, #6366f1);
+        color: white;
+        border: none;
+        border-radius: 999px;
+        padding: 8px 18px;
+        font-size: 0.9rem;
+        cursor: pointer;
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        box-shadow: 0 12px 25px rgba(56, 189, 248, 0.35);
+      }
+      button:disabled {
+        opacity: 0.5;
+        cursor: default;
+        box-shadow: none;
+      }
+      .pill {
+        font-size: 0.75rem;
+        padding: 3px 9px;
+        border-radius: 999px;
+        border: 1px solid #334155;
+        color: #9ca3af;
+      }
+      .output {
+        margin-top: 18px;
+        display: grid;
+        grid-template-columns: minmax(0, 3fr) minmax(0, 2fr);
+        gap: 16px;
+      }
+      .panel {
+        background: #020617;
+        border-radius: 12px;
+        border: 1px solid #1e293b;
+        padding: 12px 14px;
+        min-height: 120px;
+      }
+      .panel h2 {
+        font-size: 0.9rem;
+        margin: 0 0 0.35rem;
+        color: #9ca3af;
+      }
+      .answer {
+        font-size: 0.95rem;
+        white-space: pre-wrap;
+      }
+      .citation {
+        margin-bottom: 0.7rem;
+        padding-bottom: 0.5rem;
+        border-bottom: 1px dashed #1f2933;
+      }
+      .citation:last-child {
+        border-bottom: none;
+      }
+      .doc-id {
+        font-size: 0.8rem;
+        color: #9ca3af;
+        margin-bottom: 0.2rem;
+      }
+      .score {
+        font-size: 0.75rem;
+        color: #6b7280;
+      }
+      .snippet {
+        font-size: 0.9rem;
+        color: #e5e7eb;
+      }
+      .status {
+        font-size: 0.8rem;
+        color: #9ca3af;
+      }
+      .status span {
+        color: #22c55e;
+      }
+      @media (max-width: 768px) {
+        .output {
+          grid-template-columns: minmax(0, 1fr);
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="container">
+      <h1>Ask My Docs</h1>
+      <p class="subtitle">
+        Hybrid retrieval (BM25 + vectors) with cross-encoder reranking and
+        enforced citations.
+      </p>
+
+      <div class="card">
+        <label for="query">Ask a question about your docs</label>
+        <textarea
+          id="query"
+          placeholder="e.g. What is our SLA for enterprise customers?"
+        ></textarea>
+        <div class="actions">
+          <div class="status" id="status">
+            <span>Ready</span> · docs loaded from <code>docs/</code>
+          </div>
+          <div style="display: flex; align-items: center; gap: 8px">
+            <span class="pill">Top-k: 5</span>
+            <button id="ask-btn">
+              <span>Ask</span>
+            </button>
+          </div>
+        </div>
+
+        <div class="output">
+          <div class="panel">
+            <h2>Answer</h2>
+            <div id="answer" class="answer">
+              The answer will appear here, composed strictly from retrieved
+              passages.
+            </div>
+          </div>
+          <div class="panel">
+            <h2>Citations</h2>
+            <div id="citations"></div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <script>
+      const askBtn = document.getElementById("ask-btn");
+      const queryInput = document.getElementById("query");
+      const answerEl = document.getElementById("answer");
+      const citationsEl = document.getElementById("citations");
+      const statusEl = document.getElementById("status");
+
+      async function sendQuery() {
+        const query = queryInput.value.trim();
+        if (!query) return;
+
+        askBtn.disabled = true;
+        statusEl.textContent = "Running retrieval + reranking...";
+        answerEl.textContent = "Thinking...";
+        citationsEl.innerHTML = "";
+
+        try {
+          const res = await fetch("/query", {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify({ query, top_k: 5 }),
+          });
+
+          if (!res.ok) {
+            throw new Error("Request failed");
+          }
+
+          const data = await res.json();
+          answerEl.textContent = data.answer || "(no answer)";
+
+          if (!data.citations || data.citations.length === 0) {
+            citationsEl.innerHTML =
+              '<div class="citation">No citations available.</div>';
+          } else {
+            citationsEl.innerHTML = "";
+            data.citations.forEach((c) => {
+              const div = document.createElement("div");
+              div.className = "citation";
+              div.innerHTML = `
+                <div class="doc-id">${c.doc_id}</div>
+                <div class="score">score: ${c.score.toFixed(4)}</div>
+                <div class="snippet">${(c.text || "")
+                  .replace(/</g, "&lt;")
+                  .replace(/>/g, "&gt;")}</div>
+              `;
+              citationsEl.appendChild(div);
+            });
+          }
+
+          statusEl.innerHTML =
+            '<span>Done</span> · retrieval, reranking, and citation assembly complete.';
+        } catch (err) {
+          console.error(err);
+          answerEl.textContent =
+            "Something went wrong while querying the service.";
+          citationsEl.innerHTML = "";
+          statusEl.textContent = "Error while querying the backend.";
+        } finally {
+          askBtn.disabled = false;
+        }
+      }
+
+      askBtn.addEventListener("click", () => {
+        sendQuery();
+      });
+      queryInput.addEventListener("keydown", (e) => {
+        if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
+          e.preventDefault();
+          sendQuery();
+        }
+      });
+    </script>
+  </body>
+  </html>
+

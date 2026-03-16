@@ -1,0 +1,3 @@
+{"id": "q1", "question": "What is our uptime SLA for enterprise customers?", "relevant_doc_ids": ["sla.md"], "expected_answer": "For enterprise customers, our standard SLA guarantees 99.9% uptime measured monthly."}
+{"id": "q2", "question": "How quickly do we respond to P1 incidents for enterprise customers?", "relevant_doc_ids": ["sla.md"], "expected_answer": "For enterprise customers, P1 incident response is within 1 hour."}
+
